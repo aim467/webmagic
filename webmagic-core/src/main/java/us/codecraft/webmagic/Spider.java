@@ -93,6 +93,10 @@ public class Spider implements Runnable, Task {
 
     protected final static int STAT_STOPPED = 2;
 
+    protected final static int COMPLETED = 3;
+
+    protected final static int FORCE_STOPPED = 4;
+
     protected boolean spawnUrl = true;
 
     protected boolean destroyWhenExit = true;
@@ -313,6 +317,7 @@ public class Spider implements Runnable, Task {
                     poll = scheduler.poll(this);
                     if (poll == null) {
                         if (exitWhenComplete) {
+                            stat.set(COMPLETED);
                             break;
                         } else {
                             // wait
@@ -320,7 +325,9 @@ public class Spider implements Runnable, Task {
                                 Thread.sleep(emptySleepTime);
                                 continue;
                             } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
+                                logger.warn("Spider {} main thread interrupted while sleeping.", getUUID());
+                                Thread.currentThread().interrupt(); // Preserve interrupt status
+                                stat.set(FORCE_STOPPED);
                                 break;
                             }
                         }
@@ -329,6 +336,8 @@ public class Spider implements Runnable, Task {
                     // wait until new url added，
                     if (scheduler.waitNewUrl(threadPool, emptySleepTime)) {
                         // if interrupted
+                        logger.info("Spider {} main thread interrupted by scheduler.waitNewUrl.", getUUID());
+                        stat.set(FORCE_STOPPED);
                         break;
                     }
                     continue;
@@ -347,12 +356,23 @@ public class Spider implements Runnable, Task {
                         logger.error("process request " + request + " error", e);
                     } finally {
                         pageCount.incrementAndGet();
-                        scheduler.signalNewUrl();
+                        // Signal scheduler only if spider is still running
+                        if (stat.get() == STAT_RUNNING) {
+                            scheduler.signalNewUrl();
+                        }
                     }
                 }
             });
         }
-        stat.set(STAT_STOPPED);
+        // 如果是因为中断而退出循环，且状态仍为RUNNING，则标记为FORCE_STOPPED
+        if (Thread.currentThread().isInterrupted() && stat.get() == STAT_RUNNING) {
+            stat.set(FORCE_STOPPED);
+        } else if (stat.get() == STAT_RUNNING){
+            // 如果循环结束但状态仍然是RUNNING (理论上不应该发生，除非exitWhenComplete=false且无url且无线程)
+            // 这种情况下，外部也没有调用stop，可以认为是一种非预期的停止，或者如果逻辑允许，也视为完成
+            stat.set(COMPLETED); // 或者一个更通用的Stopped状态
+        }
+
         // release some resources
         if (destroyWhenExit) {
             close();
