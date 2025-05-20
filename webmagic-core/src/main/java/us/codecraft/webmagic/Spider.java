@@ -700,7 +700,7 @@ public class Spider implements Runnable, Task {
 
 
     public enum Status {
-        Init(0), Running(1), Stopped(2);
+        Init(0), Running(1), Stopped(2), Completed(3), ForceStopped(4);
 
         private Status(int value) {
             this.value = value;
