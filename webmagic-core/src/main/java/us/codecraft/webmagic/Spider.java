@@ -11,6 +11,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.SerializationUtils;
 import org.slf4j.Logger;
@@ -72,9 +73,9 @@ public class Spider implements Runnable, Task {
     protected Site site;
 
     protected String uuid;
-    
+
     protected SpiderScheduler scheduler;
-    
+
     protected Logger logger = LoggerFactory.getLogger(getClass());
 
     protected CountableThreadPool threadPool;
@@ -93,9 +94,11 @@ public class Spider implements Runnable, Task {
 
     protected final static int STAT_STOPPED = 2;
 
-    protected final static int COMPLETED = 3;
+    protected final static int STAT_COMPLETED = 3;
 
-    protected final static int FORCE_STOPPED = 4;
+    protected final static int STAT_FORCE_STOPPED = 4;
+
+    protected final static int STAT_ABORTED = 5;
 
     protected boolean spawnUrl = true;
 
@@ -103,11 +106,16 @@ public class Spider implements Runnable, Task {
 
     private List<SpiderListener> spiderListeners;
 
+    private List<SpiderEndListener> spiderEndListeners = new ArrayList<SpiderEndListener>();
+
     private final AtomicLong pageCount = new AtomicLong(0);
 
     private Date startTime;
 
     private long emptySleepTime = 30000;
+
+    private volatile Throwable unhandledException = null; // 新增：记录未处理的异常
+
 
     /**
      * create a spider with pageProcessor.
@@ -279,6 +287,37 @@ public class Spider implements Runnable, Task {
         return this;
     }
 
+    /**
+     * 新增：添加结束回调监听器
+     * @param listener SpiderEndListener
+     * @return this
+     */
+    public Spider addSpiderEndListener(SpiderEndListener listener) {
+        if (listener != null) {
+            this.spiderEndListeners.add(listener);
+        }
+        return this;
+    }
+
+    /**
+     * 新增：移除结束回调监听器
+     * @param listener SpiderEndListener
+     * @return this
+     */
+    public Spider removeSpiderEndListener(SpiderEndListener listener) {
+        this.spiderEndListeners.remove(listener);
+        return this;
+    }
+
+    /**
+     * 新增：清除所有结束回调监听器
+     * @return this
+     */
+    public Spider clearSpiderEndListeners() {
+        this.spiderEndListeners.clear();
+        return this;
+    }
+
     protected void initComponent() {
         if (downloader == null) {
             this.downloader = new HttpClientDownloader();
@@ -301,83 +340,129 @@ public class Spider implements Runnable, Task {
             startRequests.clear();
         }
         startTime = new Date();
+        unhandledException = null;
     }
 
     @Override
     public void run() {
-        checkRunningStat();
-        initComponent();
-        logger.info("Spider {} started!", getUUID());
-        // interrupt won't be necessarily detected
-        while (!Thread.currentThread().isInterrupted() && stat.get() == STAT_RUNNING) {
-            Request poll = scheduler.poll(this);
-            if (poll == null) {
-                if (threadPool.getThreadAlive() == 0) {
-                    //no alive thread anymore , try again
-                    poll = scheduler.poll(this);
-                    if (poll == null) {
-                        if (exitWhenComplete) {
-                            stat.set(COMPLETED);
-                            break;
-                        } else {
-                            // wait
-                            try {
-                                Thread.sleep(emptySleepTime);
-                                continue;
-                            } catch (InterruptedException e) {
-                                logger.warn("Spider {} main thread interrupted while sleeping.", getUUID());
-                                Thread.currentThread().interrupt(); // Preserve interrupt status
-                                stat.set(FORCE_STOPPED);
+        try {
+            checkRunningStat();
+            initComponent();
+            logger.info("Spider {} started!", getUUID());
+            // interrupt won't be necessarily detected
+            while (!Thread.currentThread().isInterrupted() && stat.get() == STAT_RUNNING) {
+                Request poll = scheduler.poll(this);
+                if (poll == null) {
+                    if (threadPool.getThreadAlive() == 0) {
+                        //no alive thread anymore , try again
+                        poll = scheduler.poll(this);
+                        if (poll == null) {
+                            if (exitWhenComplete) {
+                                stat.set(STAT_COMPLETED);
                                 break;
+                            } else {
+                                // wait
+                                try {
+                                    Thread.sleep(emptySleepTime);
+                                    continue;
+                                } catch (InterruptedException e) {
+                                    logger.warn("Spider {} main thread interrupted while sleeping.", getUUID());
+                                    Thread.currentThread().interrupt(); // Preserve interrupt status
+                                    stat.set(STAT_ABORTED);
+                                    unhandledException = e;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        // wait until new url added，
+                        if (scheduler.waitNewUrl(threadPool, emptySleepTime)) {
+                            // if interrupted
+                            logger.info("Spider {} main thread interrupted by scheduler.waitNewUrl.", getUUID());
+                            stat.set(STAT_FORCE_STOPPED);
+                            unhandledException = new InterruptedException("Spider interrupted while waiting for new URL.");
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                final Request request = poll;
+                //this may swallow the interruption
+                threadPool.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            processRequest(request);
+                            onSuccess(request);
+                        } catch (Exception e) {
+                            onError(request, e);
+                            logger.error("process request " + request + " error", e);
+                        } finally {
+                            pageCount.incrementAndGet();
+                            // Signal scheduler only if spider is still running
+                            if (stat.get() == STAT_RUNNING) {
+                                scheduler.signalNewUrl();
                             }
                         }
                     }
-                } else {
-                    // wait until new url added，
-                    if (scheduler.waitNewUrl(threadPool, emptySleepTime)) {
-                        // if interrupted
-                        logger.info("Spider {} main thread interrupted by scheduler.waitNewUrl.", getUUID());
-                        stat.set(FORCE_STOPPED);
-                        break;
+                });
+            }
+            // 如果是因为中断而退出循环，且状态仍为RUNNING，则标记为FORCE_STOPPED
+            if (Thread.currentThread().isInterrupted() && stat.get() == STAT_RUNNING) {
+                stat.set(STAT_ABORTED);
+                if (unhandledException == null) {
+                    unhandledException = new InterruptedException("Spider main thread was interrupted.");
+                }
+            } else if (stat.get() == STAT_RUNNING) {
+                // 如果循环结束但状态仍然是RUNNING (理论上不应该发生，除非exitWhenComplete=false且无url且无线程)
+                // 这种情况下，外部也没有调用stop，可以认为是一种非预期的停止，或者如果逻辑允许，也视为完成
+                stat.set(STAT_COMPLETED); // 或者一个更通用的Stopped状态
+            }
+        }catch (Exception e) {
+            logger.error("Spider {} run error, setting status to ABORTED.", getUUID(), e);
+            unhandledException = e;
+            stat.set(STAT_ABORTED);
+        }finally {
+            // release some resources
+            if (destroyWhenExit) {
+                close();
+            }
+            triggerEndListeners();
+            logger.info("Spider {} closed! {} pages downloaded.", getUUID(), pageCount.get());
+        }
+    }
+
+    /**
+     * 新增：触发结束回调
+     */
+    private void triggerEndListeners() {
+        int finalStatus = stat.get();
+        if (CollectionUtils.isNotEmpty(spiderEndListeners)) {
+            for (SpiderEndListener listener : spiderEndListeners) {
+                try {
+                    switch (finalStatus) {
+                        case STAT_COMPLETED:
+                            listener.onSpiderCompleted(this);
+                            break;
+                        case STAT_FORCE_STOPPED:
+                            listener.onSpiderForceStopped(this);
+                            break;
+                        case STAT_ABORTED:
+                            listener.onSpiderAborted(this, unhandledException);
+                            break;
+                        default:
+                            // 对于其他可能的停止状态 (如旧的 STOPPED 或 INIT)，也可能需要一个通用回调或特定处理
+                            //  或者，确保所有停止路径都会设置成 COMPLETED, FORCE_STOPPED, ABORTED 之一
+                            logger.warn("Spider ended with unhandled status for SpiderEndListener: {}", finalStatus);
+                            // 可以选择也调用onSpiderAborted作为通用错误/中断回调
+                            listener.onSpiderAborted(this, unhandledException != null ? unhandledException : new IllegalStateException("Spider stopped with status: " + finalStatus));
+                            break;
                     }
-                    continue;
+                } catch (Exception e) {
+                    logger.error("Error in SpiderEndListener while handling status {}", finalStatus, e);
                 }
             }
-            final Request request = poll;
-            //this may swallow the interruption
-            threadPool.execute(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        processRequest(request);
-                        onSuccess(request);
-                    } catch (Exception e) {
-                        onError(request, e);
-                        logger.error("process request " + request + " error", e);
-                    } finally {
-                        pageCount.incrementAndGet();
-                        // Signal scheduler only if spider is still running
-                        if (stat.get() == STAT_RUNNING) {
-                            scheduler.signalNewUrl();
-                        }
-                    }
-                }
-            });
         }
-        // 如果是因为中断而退出循环，且状态仍为RUNNING，则标记为FORCE_STOPPED
-        if (Thread.currentThread().isInterrupted() && stat.get() == STAT_RUNNING) {
-            stat.set(FORCE_STOPPED);
-        } else if (stat.get() == STAT_RUNNING){
-            // 如果循环结束但状态仍然是RUNNING (理论上不应该发生，除非exitWhenComplete=false且无url且无线程)
-            // 这种情况下，外部也没有调用stop，可以认为是一种非预期的停止，或者如果逻辑允许，也视为完成
-            stat.set(COMPLETED); // 或者一个更通用的Stopped状态
-        }
-
-        // release some resources
-        if (destroyWhenExit) {
-            close();
-        }
-        logger.info("Spider {} closed! {} pages downloaded.", getUUID(), pageCount.get());
     }
 
     /**
@@ -453,12 +538,12 @@ public class Spider implements Runnable, Task {
 
     private void processRequest(Request request) {
         Page page;
-        if (null != request.getDownloader()){
-            page = request.getDownloader().download(request,this);
-        }else {
+        if (null != request.getDownloader()) {
+            page = request.getDownloader().download(request, this);
+        } else {
             page = downloader.download(request, this);
         }
-        if (page.isDownloadSuccess()){
+        if (page.isDownloadSuccess()) {
             onDownloadSuccess(request, page);
         } else {
             onDownloaderFail(request);
@@ -466,7 +551,7 @@ public class Spider implements Runnable, Task {
     }
 
     private void onDownloadSuccess(Request request, Page page) {
-        if (site.getAcceptStatCode().contains(page.getStatusCode())){
+        if (site.getAcceptStatCode().contains(page.getStatusCode())) {
             pageProcessor.process(page);
             extractAndAddRequests(page, spawnUrl);
             if (!page.getResultItems().isSkip()) {
@@ -507,8 +592,10 @@ public class Spider implements Runnable, Task {
         try {
             Thread.sleep(time);
         } catch (InterruptedException e) {
-            logger.error("Thread interrupted when sleep",e);
+            logger.error("Thread interrupted when sleep", e);
             Thread.currentThread().interrupt();
+            stat.compareAndSet(STAT_RUNNING, STAT_ABORTED);
+            unhandledException = e;
         }
     }
 
@@ -563,7 +650,7 @@ public class Spider implements Runnable, Task {
     public <T> List<T> getAll(Collection<String> urls) {
         destroyWhenExit = false;
         spawnUrl = false;
-        if (startRequests!=null){
+        if (startRequests != null) {
             startRequests.clear();
         }
         for (Request request : UrlUtils.convertToRequests(urls)) {
@@ -610,17 +697,29 @@ public class Spider implements Runnable, Task {
     }
 
     public void stop() {
-        if (stat.compareAndSet(STAT_RUNNING, STAT_STOPPED)) {
-            logger.info("Spider " + getUUID() + " stop success!");
-        } else {
-            logger.info("Spider " + getUUID() + " stop fail!");
+        // 确保即使爬虫已经因为其他原因（如完成或异常）停止，调用stop也会将其标记为FORCE_STOPPED
+        // 除非它已经是COMPLETED或ABORTED。
+        int currentStat = stat.get();
+        if (currentStat == STAT_RUNNING) {
+            if (stat.compareAndSet(STAT_RUNNING, STAT_FORCE_STOPPED)) {
+                logger.info("Spider {} stop success!", getUUID());
+            } else { // 可能在比较和设置之间状态已改变
+                logger.info("Spider {} stop attempt failed as status changed during operation. Original status: {}, Current status: {}", getUUID(), Status.fromValue(currentStat), Status.fromValue(stat.get()));
+            }
+        } else if (currentStat == STAT_INIT) {
+            // 如果在INIT状态就stop，也标记为FORCE_STOPPED，因为是外部干预了正常启动流程
+            stat.set(STAT_FORCE_STOPPED);
+            logger.info("Spider {} stopped before starting (marked as FORCE_STOPPED).", getUUID());
+        }
+        else {
+            logger.info("Spider {} is not running or already stopped/completed. Current status: {}", getUUID(), Status.fromValue(currentStat));
         }
     }
 
     /**
      * Stop when all tasks in the queue are completed and all worker threads are also completed
      */
-    public void stopWhenComplete(){
+    public void stopWhenComplete() {
         this.exitWhenComplete = true;
     }
 
@@ -700,7 +799,7 @@ public class Spider implements Runnable, Task {
 
 
     public enum Status {
-        Init(0), Running(1), Stopped(2), Completed(3), ForceStopped(4);
+        Init(0), Running(1), Stopped(2), Completed(3), ForceStopped(4), ABORTED(5);
 
         private Status(int value) {
             this.value = value;
@@ -797,7 +896,7 @@ public class Spider implements Runnable, Task {
      * @return this
      */
     public Spider setEmptySleepTime(long emptySleepTime) {
-        if(emptySleepTime<=0){
+        if (emptySleepTime <= 0) {
             throw new IllegalArgumentException("emptySleepTime should be more than zero!");
         }
         this.emptySleepTime = emptySleepTime;
